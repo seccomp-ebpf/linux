@@ -43,6 +43,9 @@
 #include <linux/uaccess.h>
 #include <linux/anon_inodes.h>
 #include <linux/lockdep.h>
+#include <linux/bpf.h>
+#include <linux/fdtable.h>
+#include <linux/rcupdate_trace.h>
 
 /*
  * When SECCOMP_IOCTL_NOTIF_ID_VALID was first introduced, it had the
@@ -413,7 +416,16 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
 	 * value always takes priority (ignoring the DATA).
 	 */
 	for (; f; f = f->prev) {
-		u32 cur_ret = bpf_prog_run_pin_on_cpu(f->prog, sd);
+		u32 cur_ret;
+		struct bpf_run_ctx *old_run_ctx;
+		struct bpf_seccomp_run_ctx run_ctx; 
+
+		rcu_read_lock_trace();
+		old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
+		run_ctx.pid_ns = f->prog->aux->pid_ns;
+		cur_ret = bpf_prog_run_pin_on_cpu(f->prog, sd);
+		bpf_reset_run_ctx(old_run_ctx);
+		rcu_read_unlock_trace();
 
 		if (ACTION_ONLY(cur_ret) < ACTION_ONLY(ret)) {
 			ret = cur_ret;
@@ -513,7 +525,10 @@ static inline pid_t seccomp_can_sync_threads(void)
 static inline void seccomp_filter_free(struct seccomp_filter *filter)
 {
 	if (filter) {
-		bpf_prog_destroy(filter->prog);
+		if (bpf_prog_was_classic(filter->prog))
+			bpf_prog_destroy(filter->prog);
+		else
+			bpf_prog_put(filter->prog);
 		kfree(filter);
 	}
 }
@@ -647,16 +662,6 @@ static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
 
 	BUG_ON(INT_MAX / fprog->len < sizeof(struct sock_filter));
 
-	/*
-	 * Installing a seccomp filter requires that the task has
-	 * CAP_SYS_ADMIN in its namespace or be running with no_new_privs.
-	 * This avoids scenarios where unprivileged tasks can affect the
-	 * behavior of privileged children.
-	 */
-	if (!task_no_new_privs(current) &&
-			!ns_capable_noaudit(current_user_ns(), CAP_SYS_ADMIN))
-		return ERR_PTR(-EACCES);
-
 	/* Allocate a new seccomp_filter */
 	sfilter = kzalloc(sizeof(*sfilter), GFP_KERNEL | __GFP_NOWARN);
 	if (!sfilter)
@@ -704,6 +709,66 @@ seccomp_prepare_user_filter(const char __user *user_filter)
 out:
 	return filter;
 }
+
+#ifdef CONFIG_SECCOMP_FILTER_EXTENDED
+/**
+ * seccomp_prepare_extended_filter - prepares a user-supplied eBPF fd
+ * @user_filter: pointer to the user data containing an fd.
+ *
+ * Returns 0 on success and non-zero otherwise.
+ */
+static struct seccomp_filter *
+seccomp_prepare_extended_filter(const int __user *user_fd)
+{
+	struct seccomp_filter *sfilter;
+	struct bpf_prog *fp;
+	int fd;
+	int err;
+
+	/* Fetch the fd from userspace */
+	if (get_user(fd, user_fd))
+		return ERR_PTR(-EFAULT);
+
+	/* Allocate a new seccomp_filter */
+	sfilter = kzalloc(sizeof(*sfilter), GFP_KERNEL | __GFP_NOWARN);
+	if (!sfilter)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_init(&sfilter->notify_lock);
+	fp = bpf_prog_get_type(fd, BPF_PROG_TYPE_SECCOMP);
+
+	if (IS_ERR(fp)) {
+		kfree(sfilter);
+		return ERR_CAST(fp);
+	}
+
+	if (fp->aux->user_ns != current_user_ns()) {
+		bpf_prog_put(fp);
+		kfree(sfilter);
+		return ERR_PTR(-EPERM);
+	}
+
+	err = close_fd(fd);
+	if (err) {
+		bpf_prog_put(fp);
+		kfree(sfilter);
+		return ERR_PTR(err);
+	}
+
+	sfilter->prog = fp;
+	refcount_set(&sfilter->refs, 1);
+	refcount_set(&sfilter->users, 1);
+	init_waitqueue_head(&sfilter->wqh);
+
+	return sfilter;
+}
+#else
+static struct seccomp_filter *
+seccomp_prepare_extended_filter(const int __user *filter_fd)
+{
+	return ERR_PTR(-EINVAL);
+}
+#endif
 
 #ifdef SECCOMP_ARCH_NATIVE
 /**
@@ -793,7 +858,10 @@ static void seccomp_cache_prepare_bitmap(struct seccomp_filter *sfilter,
 	struct seccomp_data sd;
 	int nr;
 
-	if (bitmap_prev) {
+	if (!bpf_prog_was_classic(sfilter->prog)) {
+		/* eBPF program, no caching. */
+		bitmap_zero(bitmap, bitmap_size);
+	} else if (bitmap_prev) {
 		/* The new filter must be as restrictive as the last. */
 		bitmap_copy(bitmap, bitmap_prev, bitmap_size);
 	} else {
@@ -1796,9 +1864,10 @@ static bool has_duplicate_listener(struct seccomp_filter *new_child)
  * Returns 0 on success or -EINVAL on failure.
  */
 static long seccomp_set_mode_filter(unsigned int flags,
-				    const char __user *filter)
+				    const void __user *filter)
 {
-	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
+	/* We use SECCOMP_MODE_FILTER for both eBPF and cBPF filters */
+	const unsigned long filter_mode = SECCOMP_MODE_FILTER;
 	struct seccomp_filter *prepared = NULL;
 	long ret = -EINVAL;
 	int listener = -1;
@@ -1821,9 +1890,29 @@ static long seccomp_set_mode_filter(unsigned int flags,
 		return -EINVAL;
 
 	/* Prepare the new filter before holding any locks. */
-	prepared = seccomp_prepare_user_filter(filter);
+	if (flags & SECCOMP_FILTER_FLAG_EXTENDED)
+		prepared = seccomp_prepare_extended_filter(filter);
+	else
+		prepared = seccomp_prepare_user_filter(filter);
+
 	if (IS_ERR(prepared))
 		return PTR_ERR(prepared);
+
+	/*
+	 * Installing a seccomp filter requires that the task has
+	 * CAP_SYS_ADMIN in its namespace or be running with no_new_privs.
+	 * This avoids scenarios where unprivileged tasks can affect the
+	 * behavior of privileged children.
+	 *
+	 * This is checked after filter preparation because the user
+	 * will get an EINVAL if their filter is invalid prior to the
+	 * EACCES.
+	 */
+	if (!task_no_new_privs(current) &&
+	    !ns_capable_noaudit(current_user_ns(), CAP_SYS_ADMIN)) {
+		ret = -EACCES;
+		goto out_free;
+	}
 
 	if (flags & SECCOMP_FILTER_FLAG_NEW_LISTENER) {
 		listener = get_unused_fd_flags(O_CLOEXEC);
@@ -1850,7 +1939,7 @@ static long seccomp_set_mode_filter(unsigned int flags,
 
 	spin_lock_irq(&current->sighand->siglock);
 
-	if (!seccomp_may_assign_mode(seccomp_mode))
+	if (!seccomp_may_assign_mode(filter_mode))
 		goto out;
 
 	if (has_duplicate_listener(prepared)) {
@@ -1864,7 +1953,7 @@ static long seccomp_set_mode_filter(unsigned int flags,
 	/* Do not free the successfully attached filter. */
 	prepared = NULL;
 
-	seccomp_assign_mode(current, seccomp_mode, flags);
+	seccomp_assign_mode(current, filter_mode, flags);
 out:
 	spin_unlock_irq(&current->sighand->siglock);
 	if (flags & SECCOMP_FILTER_FLAG_TSYNC)
@@ -2060,15 +2149,17 @@ long seccomp_get_filter(struct task_struct *task, unsigned long filter_off,
 	if (IS_ERR(filter))
 		return PTR_ERR(filter);
 
+	/* This must be a new non-cBPF filter, since we save
+	 * every cBPF filter's orig_prog above when
+	 * CONFIG_CHECKPOINT_RESTORE is enabled.
+	 */
+	ret = -EMEDIUMTYPE;
+
 	fprog = filter->prog->orig_prog;
-	if (!fprog) {
-		/* This must be a new non-cBPF filter, since we save
-		 * every cBPF filter's orig_prog above when
-		 * CONFIG_CHECKPOINT_RESTORE is enabled.
-		 */
-		ret = -EMEDIUMTYPE;
+	if (!fprog)
 		goto out;
-	}
+	if (!bpf_prog_was_classic(filter->prog))
+		goto out;
 
 	ret = fprog->len;
 	if (!data)
@@ -2113,6 +2204,94 @@ long seccomp_get_metadata(struct task_struct *task,
 	if (copy_to_user(data, &kmd, size))
 		ret = -EFAULT;
 
+	__put_seccomp_filter(filter);
+	return ret;
+}
+#endif
+
+#if defined(CONFIG_SECCOMP_FILTER_EXTENDED) && defined(CONFIG_CHECKPOINT_RESTORE)
+long seccomp_get_filter_extended(struct task_struct *task,
+				 unsigned long filter_off,
+				 void __user *data)
+{
+	struct seccomp_filter *filter;
+	struct bpf_prog *prog;
+	long ret;
+
+	if (!capable(CAP_SYS_ADMIN) ||
+	    current->seccomp.mode != SECCOMP_MODE_DISABLED) {
+		return -EACCES;
+	}
+
+	filter = get_nth_filter(task, filter_off);
+	if (IS_ERR(filter))
+		return PTR_ERR(filter);
+
+	if (bpf_prog_was_classic(filter->prog)) {
+		ret = -EMEDIUMTYPE;
+		goto out;
+	}
+	prog = bpf_prog_inc_not_zero(filter->prog);
+	if (IS_ERR(prog)) {
+		ret = PTR_ERR(prog);
+		goto out;
+	}
+
+	ret = bpf_prog_new_fd(filter->prog);
+	if (ret < 0)
+		bpf_prog_put(prog);
+out:
+	__put_seccomp_filter(filter);
+	return ret;
+}
+
+long seccomp_get_map_extended(struct task_struct *task,
+				 unsigned long filter_off,
+				 unsigned long map_off)
+{
+	struct seccomp_filter *filter;
+	struct bpf_prog *prog;
+	struct bpf_map *map;
+	long ret;
+
+	if (!capable(CAP_SYS_ADMIN) ||
+		current->seccomp.mode != SECCOMP_MODE_DISABLED) {
+		return -EACCES;
+	}
+
+	filter = get_nth_filter(task, filter_off);
+	if (IS_ERR(filter))
+		return PTR_ERR(filter);
+
+	if (bpf_prog_was_classic(filter->prog)) {
+		ret = -EMEDIUMTYPE;
+		goto out_put_filter;
+	}
+
+	prog = bpf_prog_inc_not_zero(filter->prog);
+	if (IS_ERR(prog)) {
+		ret = PTR_ERR(prog);
+		goto out_put_filter;
+	}
+
+	if (map_off >= prog->aux->used_map_cnt) {
+		ret = -ENOENT;
+		goto out_put_prog;
+	}
+
+	map = bpf_map_inc_not_zero(prog->aux->used_maps[map_off]);
+	if (IS_ERR(map)) {
+		ret = PTR_ERR(map);
+		goto out_put_prog;
+	}
+
+	ret = bpf_map_new_fd(map, O_RDWR);
+	if (ret < 0)
+		bpf_map_put(map);
+
+out_put_prog:
+	bpf_prog_put(prog);
+out_put_filter:
 	__put_seccomp_filter(filter);
 	return ret;
 }
@@ -2320,6 +2499,84 @@ static int seccomp_actions_logged_handler(struct ctl_table *ro_table, int write,
 
 	return ret;
 }
+
+#ifdef CONFIG_SECCOMP_FILTER_EXTENDED
+static bool seccomp_is_valid_access(int off, int size,
+				    enum bpf_access_type type,
+					const struct bpf_prog *prog,
+				    struct bpf_insn_access_aux *info)
+{
+	if (type != BPF_READ)
+		return false;
+
+	if (off < 0 || off + size > sizeof(struct seccomp_data))
+		return false;
+
+	if (off % size != 0)
+		return false;
+
+	switch (off) {
+	case bpf_ctx_range_till(struct seccomp_data, args[0], args[5]):
+		return (size == sizeof(__u64));
+	case bpf_ctx_range(struct seccomp_data, nr):
+		return (size == sizeof_field(struct seccomp_data, nr));
+	case bpf_ctx_range(struct seccomp_data, arch):
+		return (size == sizeof_field(struct seccomp_data, arch));
+	case bpf_ctx_range(struct seccomp_data, instruction_pointer):
+		return (size == sizeof_field(struct seccomp_data,
+					     instruction_pointer));
+	default:
+		return false;
+	}
+}
+
+static const struct bpf_func_proto *
+seccomp_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	if (security_seccomp_extended())
+		return NULL;
+
+	switch (func_id) {
+	case BPF_FUNC_get_current_uid_gid:
+		return &bpf_get_current_uid_gid_proto;
+	case BPF_FUNC_get_current_pid_tgid:
+		return &bpf_get_current_pid_tgid_ns_proto;
+	case BPF_FUNC_probe_read_user:
+		return ns_capable(current_user_ns(), CAP_SYS_PTRACE) ?
+			&bpf_probe_read_user_proto :
+			&bpf_probe_read_user_dumpable_proto;
+	case BPF_FUNC_probe_read_user_str:
+		return ns_capable(current_user_ns(), CAP_SYS_PTRACE) ?
+			&bpf_probe_read_user_str_proto :
+			&bpf_probe_read_user_dumpable_str_proto;
+	case BPF_FUNC_task_storage_get:
+		return &bpf_task_storage_get_default_leader_proto;
+	case BPF_FUNC_task_storage_delete:
+		return &bpf_task_storage_delete_default_leader_proto;
+	default:
+		break;
+	}
+
+	if (bpf_capable() && perfmon_capable())
+		return bpf_tracing_func_proto(func_id, prog);
+	else
+		return bpf_base_func_proto(func_id);
+}
+
+const struct bpf_prog_ops seccomp_prog_ops = {
+};
+
+static bool seccomp_map_access(enum bpf_access_type type)
+{
+	return !security_seccomp_extended();
+}
+
+const struct bpf_verifier_ops seccomp_verifier_ops = {
+	.get_func_proto		= seccomp_func_proto,
+	.is_valid_access	= seccomp_is_valid_access,
+	.map_access		= seccomp_map_access,
+};
+#endif /* CONFIG_SECCOMP_FILTER_EXTENDED */
 
 static struct ctl_path seccomp_sysctl_path[] = {
 	{ .procname = "kernel", },

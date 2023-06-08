@@ -23,6 +23,8 @@
 #include <linux/slab.h>
 #include <linux/percpu-refcount.h>
 #include <linux/bpfptr.h>
+#include <linux/user_namespace.h>
+#include <linux/pid_namespace.h>
 
 struct bpf_verifier_env;
 struct bpf_verifier_log;
@@ -332,6 +334,7 @@ enum bpf_arg_type {
 	ARG_PTR_TO_SOCKET,	/* pointer to bpf_sock (fullsock) */
 	ARG_PTR_TO_SOCKET_OR_NULL,	/* pointer to bpf_sock (fullsock) or NULL */
 	ARG_PTR_TO_BTF_ID,	/* pointer to in-kernel struct */
+	ARG_PTR_TO_BTF_ID_OR_NULL,	/* pointer to in-kernel struct or NULL */
 	ARG_PTR_TO_ALLOC_MEM,	/* pointer to dynamically allocated memory */
 	ARG_PTR_TO_ALLOC_MEM_OR_NULL,	/* pointer to dynamically allocated memory or NULL */
 	ARG_CONST_ALLOC_SIZE_OR_ZERO,	/* number of allocated bytes requested */
@@ -514,6 +517,7 @@ struct bpf_verifier_ops {
 				 enum bpf_access_type atype,
 				 u32 *next_btf_id);
 	bool (*check_kfunc_call)(u32 kfunc_btf_id);
+	bool (*map_access)(enum bpf_access_type type);
 };
 
 struct bpf_prog_offload_ops {
@@ -923,6 +927,8 @@ struct bpf_prog_aux {
 		struct work_struct work;
 		struct rcu_head	rcu;
 	};
+	struct user_namespace *user_ns;
+	struct pid_namespace *pid_ns;
 };
 
 struct bpf_array_aux {
@@ -1155,6 +1161,11 @@ struct bpf_run_ctx {};
 struct bpf_cg_run_ctx {
 	struct bpf_run_ctx run_ctx;
 	const struct bpf_prog_array_item *prog_item;
+};
+
+struct bpf_seccomp_run_ctx {
+	struct bpf_run_ctx run_ctx;
+	struct pid_namespace *pid_ns;
 };
 
 struct bpf_trace_run_ctx {
@@ -1429,6 +1440,8 @@ bpf_map_alloc_percpu(const struct bpf_map *map, size_t size, size_t align,
 #endif
 
 extern int sysctl_unprivileged_bpf_disabled;
+
+extern int sysctl_seccomp_ebpf_priv_only;
 
 static inline bool bpf_allow_ptr_leaks(void)
 {
@@ -2100,11 +2113,21 @@ extern const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto;
 extern const struct bpf_func_proto bpf_sock_from_file_proto;
 extern const struct bpf_func_proto bpf_get_socket_ptr_cookie_proto;
 extern const struct bpf_func_proto bpf_task_storage_get_proto;
+extern const struct bpf_func_proto bpf_task_storage_get_default_leader_proto;
 extern const struct bpf_func_proto bpf_task_storage_delete_proto;
+extern const struct bpf_func_proto bpf_task_storage_delete_default_leader_proto;
 extern const struct bpf_func_proto bpf_for_each_map_elem_proto;
 extern const struct bpf_func_proto bpf_btf_find_by_name_kind_proto;
 extern const struct bpf_func_proto bpf_sk_setsockopt_proto;
 extern const struct bpf_func_proto bpf_sk_getsockopt_proto;
+extern const struct bpf_func_proto bpf_probe_read_user_proto;
+extern const struct bpf_func_proto bpf_probe_read_user_dumpable_proto;
+extern const struct bpf_func_proto bpf_probe_read_user_str_proto;
+extern const struct bpf_func_proto bpf_probe_read_user_dumpable_str_proto;
+extern const struct bpf_func_proto bpf_get_current_pid_tgid_ns_proto;
+
+const struct bpf_func_proto *bpf_tracing_func_proto(
+	enum bpf_func_id func_id, const struct bpf_prog *prog);
 
 const struct bpf_func_proto *tracing_prog_func_proto(
   enum bpf_func_id func_id, const struct bpf_prog *prog);

@@ -485,7 +485,8 @@ static bool arg_type_may_be_null(enum bpf_arg_type type)
 	       type == ARG_PTR_TO_CTX_OR_NULL ||
 	       type == ARG_PTR_TO_SOCKET_OR_NULL ||
 	       type == ARG_PTR_TO_ALLOC_MEM_OR_NULL ||
-	       type == ARG_PTR_TO_STACK_OR_NULL;
+	       type == ARG_PTR_TO_STACK_OR_NULL ||
+	       type == ARG_PTR_TO_BTF_ID_OR_NULL;
 }
 
 /* Determine whether the function releases some resources allocated by another
@@ -3180,6 +3181,9 @@ static int check_map_access_type(struct bpf_verifier_env *env, u32 regno,
 	struct bpf_map *map = regs[regno].map_ptr;
 	u32 cap = bpf_map_flags_to_cap(map);
 
+	if (env->ops->map_access && !env->ops->map_access(type))
+		cap = 0;
+
 	if (type == BPF_WRITE && !(cap & BPF_MAP_CAN_WRITE)) {
 		verbose(env, "write into map forbidden, value_size=%d off=%d size=%d\n",
 			map->value_size, off, size);
@@ -4956,6 +4960,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_SOCKET]		= &fullsock_types,
 	[ARG_PTR_TO_SOCKET_OR_NULL]	= &fullsock_types,
 	[ARG_PTR_TO_BTF_ID]		= &btf_ptr_types,
+	[ARG_PTR_TO_BTF_ID_OR_NULL]	= &btf_ptr_types,
 	[ARG_PTR_TO_SPIN_LOCK]		= &spin_lock_types,
 	[ARG_PTR_TO_MEM]		= &mem_types,
 	[ARG_PTR_TO_MEM_OR_NULL]	= &mem_types,
@@ -5614,10 +5619,14 @@ static bool check_btf_id_ok(const struct bpf_func_proto *fn)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(fn->arg_type); i++) {
-		if (fn->arg_type[i] == ARG_PTR_TO_BTF_ID && !fn->arg_btf_id[i])
+		if ((fn->arg_type[i] == ARG_PTR_TO_BTF_ID ||
+		     fn->arg_type[i] == ARG_PTR_TO_BTF_ID_OR_NULL) &&
+		    !fn->arg_btf_id[i])
 			return false;
 
-		if (fn->arg_type[i] != ARG_PTR_TO_BTF_ID && fn->arg_btf_id[i])
+		if ((fn->arg_type[i] != ARG_PTR_TO_BTF_ID &&
+		     fn->arg_type[i] != ARG_PTR_TO_BTF_ID_OR_NULL) &&
+		    fn->arg_btf_id[i])
 			return false;
 	}
 
